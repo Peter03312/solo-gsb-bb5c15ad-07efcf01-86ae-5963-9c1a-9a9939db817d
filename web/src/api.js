@@ -32,4 +32,8 @@ export const api = {
   publications: () => request('/api/publications'),
   publication: v => request(`/api/publications/${v}`),
   publish: payload => request('/api/publications', { method: 'POST', body: JSON.stringify(payload) }),
+  appealPreview: payload =>
+    request('/api/appeals/preview', { method: 'POST', body: JSON.stringify(payload) }),
+  appealConfirm: payload =>
+    request('/api/appeals/confirm', { method: 'POST', body: JSON.stringify(payload) }),
 };

@@ -4,6 +4,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getDb, initDb, bumpRevision, currentRevision } from './db.mjs';
 import { loadConfig, computeResults } from './scoring.mjs';
+import {
+  validateOperations, canonicalOps, signPreview, verifyPreview,
+  previewCase, commitCase,
+} from './appeals.mjs';
 import { seedDemo } from './seed.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -274,6 +278,75 @@ app.post('/api/punches/:id/correct', (req, res) => {
     return bumpRevision(db);
   })();
   res.json({ ok: true, revision });
+});
+
+// ---------- 整案申诉：预演 + 确认（两阶段，原子落库） ----------
+/**
+ * POST /api/appeals/preview
+ * body: { expectedRevision, operations: [{ punchId, action:'void'|'correct', reason, newPoint?, newSeconds? }] }
+ * 只读预演：基于当前修订号展示处理前后所有受影响选手的成绩/名次/失败原因/有效链差异，
+ * 不改动打卡、审计、修订号或任何历史发布版。返回签名 token 供确认绑定。
+ */
+app.post('/api/appeals/preview', (req, res) => {
+  if (!checkRevision(req, res)) return;
+  const cfg = loadConfig(db);
+  if (!cfg) return badRequest(res, '赛事尚未配置');
+  const v = validateOperations(db, req.body?.operations);
+  if (v.error) return badRequest(res, v.error);
+  const operations = canonicalOps(v.operations);
+
+  const preview = previewCase(db, cfg, v.operations, v.targets);
+  const token = signPreview(cfg.revision, operations);
+  res.json({
+    ok: true,
+    revision: cfg.revision,
+    token,
+    operations,
+    affectedCount: preview.affectedCount,
+    affected: preview.affected,
+  });
+});
+
+/**
+ * POST /api/appeals/confirm
+ * body: { expectedRevision, token }
+ * 确认只绑定「预演时的修订号 + 预演的操作集合」（签名在 token 内）：
+ *  - 赛事已变化（expectedRevision 过期）→ 409 + currentRevision，要求重新预演；
+ *  - token 缺失/非法/服务重启后失效 → 400，要求重新预演；
+ *  - token 修订与当前修订不一致 → 409 + currentRevision；
+ *  - 再次整案校验（缺失打卡/已作废/重复等）失败 → 400 整案拒绝。
+ * 通过后全部变更与逐条审计在一个事务内一次性落库，修订号只推进一次，
+ * 返回最新成绩；任何失败均不会部分生效。
+ */
+app.post('/api/appeals/confirm', (req, res) => {
+  const expectedRaw = req.body?.expectedRevision;
+  const expected = Number(expectedRaw);
+  if (expectedRaw == null || !Number.isInteger(expected) || expected < 0)
+    return badRequest(res, '缺少 expectedRevision');
+  const cur = currentRevision(db);
+  if (expected !== cur)
+    return res.status(409).json({ error: '赛事已修订，请重新预演后再确认', currentRevision: cur });
+
+  const payload = verifyPreview(req.body?.token);
+  if (!payload)
+    return badRequest(res, '预演令牌无效或已过期（服务重启后），请重新预演整案');
+  if (payload.revision !== cur)
+    return res.status(409).json({ error: '赛事已修订，请重新预演后再确认', currentRevision: cur });
+
+  const cfg = loadConfig(db);
+  if (!cfg) return badRequest(res, '赛事尚未配置');
+  // 确认时以令牌中的操作集合重新整案校验（数据可能已被他人改动）
+  const v = validateOperations(db, payload.operations);
+  if (v.error) return badRequest(res, v.error);
+
+  const { revision, results } = commitCase(db, cfg, v.operations, v.targets);
+  res.json({
+    ok: true,
+    revision,
+    committed: canonicalOps(v.operations),
+    auditCount: v.operations.length,
+    results,
+  });
 });
 
 // ---------- 发布（冻结） ----------

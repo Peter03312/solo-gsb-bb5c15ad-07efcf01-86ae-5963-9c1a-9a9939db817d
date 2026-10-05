@@ -25,8 +25,20 @@ export function loadConfig(db) {
 export function computeResults(db, config = loadConfig(db)) {
   if (!config) return [];
   const runners = db.prepare('SELECT bib, name FROM runner ORDER BY bib').all();
-  const results = runners.map((r) => computeRunner(db, config, r.bib, r.name));
-  // 完成者按耗时升序；其余不排名
+  const results = runners.map((r) => {
+    const readings = db
+      .prepare(
+        `SELECT id, record_no, point, seconds, kind FROM punch
+         WHERE bib = ? AND status = 'active' ORDER BY seconds, id`
+      )
+      .all(r.bib);
+    return computeRunnerFromReadings(readings, config, r.bib, r.name);
+  });
+  return rankResults(results);
+}
+
+/** 全局排名：完成者按耗时升序（含并列），无有效链不排名。可用于内存中的预演结果。 */
+export function rankResults(results) {
   results.sort((a, b) => {
     if (a.elapsed == null && b.elapsed == null) return a.bib.localeCompare(b.bib);
     if (a.elapsed == null) return 1;
@@ -52,13 +64,25 @@ export function computeResults(db, config = loadConfig(db)) {
  * 有效读数 = status='active'（作废/已被更正的旧读数不参与）。
  */
 export function computeRunner(db, config, bib, name = null) {
-  const base = { bib, name, status: 'ok', elapsed: null, failAt: null, detail: '', chain: [] };
   const punches = db
     .prepare(
       `SELECT id, record_no, point, seconds, kind FROM punch
        WHERE bib = ? AND status = 'active' ORDER BY seconds, id`
     )
     .all(bib);
+  return computeRunnerFromReadings(punches, config, bib, name);
+}
+
+/**
+ * 纯函数版核算：给定某选手的有效读数数组（内存预演可用虚拟读数），
+ * 计算最早有效链、失败原因与耗时。readings 形如 { record_no, point, seconds, kind }。
+ */
+export function computeRunnerFromReadings(readings, config, bib, name = null) {
+  const base = { bib, name, status: 'ok', elapsed: null, failAt: null, detail: '', chain: [] };
+  // 保证按 seconds、记录次序严格递增处理（调用方通常已排序，这里再排一次以免预演漏排）
+  const punches = [...readings].sort((a, b) =>
+    a.seconds !== b.seconds ? a.seconds - b.seconds : String(a.record_no).localeCompare(String(b.record_no))
+  );
 
   // 唯一出发打卡（kind=start）。途中再次经过起点的打卡属于多余打卡，不作出发依据。
   const starts = punches.filter((p) => p.kind === 'start');
@@ -70,7 +94,7 @@ export function computeRunner(db, config, bib, name = null) {
   if (start.point !== config.start_point)
     return { ...base, status: 'bad_start', detail: `出发打卡点位非起点「${config.start_point}」` };
 
-  const after = punches.filter((p) => p.id !== start.id && p.seconds >= start.seconds);
+  const after = punches.filter((p) => p.record_no !== start.record_no && p.seconds >= start.seconds);
   let lastSeconds = start.seconds;
   const chain = [slim(start)];
 

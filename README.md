@@ -95,6 +95,26 @@ npm start          # http://localhost:3000
 - **更正**打卡：填写原因与新点位/新秒数（非负），系统保留原值、新值、原因、时间，并重算成绩。
 - 作废/更正影响的是**当前实时成绩**；已发布版本不受影响。
 
+### 整案申诉（预演 → 确认，两阶段原子提交）
+
+同一申诉往往涉及**多条打卡**，可一次性组成「整案」处理：
+
+1. 裁判为每条现有打卡逐条选择**作废**（仅填原因）或**更正**（原因 + 新点位 + **非负整数秒数**）；
+   **已作废打卡不得再处理，同一打卡在同一整案中不得重复指定**。
+2. 先调用**预演**：系统基于**当前赛事修订号**在内存中演练整案（**完全只读**——不改打卡、审计、修订号，
+   也不碰历史发布版），返回：
+   - 处理前/后每一名**受影响选手**的成绩、名次、状态、失败原因（失败组/超时秒数）与**有效链差异**
+     （移出/纳入哪些记录）；
+   - 受影响名单**包含仅因他人成绩变化而名次改变**的选手（标记 `direct:false`，其有效链差异为空）；
+   - 一个签名 `token`，绑定「预演时修订号 + 规范化操作集合」。
+3. 核对无误后再调用**确认**，携带相同的 `expectedRevision` 与预演返回的 `token`：
+   - 赛事已被他人修订（修订号不一致）→ **HTTP 409 并返回 `currentRevision`**，必须重新预演；
+   - token 缺失/非法/服务重启后失效、或确认时再次整案校验发现打卡缺失/已作废等 → **400 整案拒绝**；
+   - 成功则**全部变更与逐条审计在一个事务内一次性落库，修订号只推进一次**，并返回最新成绩；
+   - 任何失败都**不会部分生效**。
+4. 已发布历史版保持冻结；首次入库原始读数（`orig_*`）仍用于重导判定，不受整案更正影响。
+5. 现有单条作废/更正、批量导入、发布接口保持不变，与整案接口完全兼容。
+
 ## 发布冻结与赛事修订
 
 - 每次关卡设置、批量导入（确有新增时）、作废/更正、发布都会推进赛事 `revision` 修订号；
@@ -201,12 +221,68 @@ curl -s -X POST http://localhost:3000/api/publications \
 curl -s http://localhost:3000/api/publications/1
 ```
 
+### 整案申诉 HTTP 调用示例
+
+```bash
+# 1) 先查当前修订号（也可从 /api/event 与 /api/results 顶部获取）
+curl -s http://localhost:3000/api/event
+# -> { "revision": 3, ... }
+
+# 2) 预演整案（只读，不落库；punchId 来自 GET /api/punches?bib=090）
+curl -s -X POST http://localhost:3000/api/appeals/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expectedRevision": 3,
+    "operations": [
+      { "punchId": 42, "action": "void",
+        "reason": "申诉成立：设备重复出发" },
+      { "punchId": 43, "action": "correct",
+        "reason": "申诉成立：点位/秒数笔误",
+        "newPoint": "B1", "newSeconds": 500 },
+      { "punchId": 44, "action": "correct",
+        "reason": "申诉成立：终点读数有误",
+        "newPoint": "F", "newSeconds": 650 }
+    ]
+  }'
+# -> {
+#      "ok": true, "revision": 3, "token": "<签名令牌>",
+#      "affectedCount": 3,
+#      "affected": [
+#        { "bib": "090", "direct": true,  "changed": true,
+#          "before": { "status": "bad_start", ... },
+#          "after":  { "status": "ok", "elapsed": 650, "rank": 1, ... },
+#          "chainDiff": { "added": [...], "removed": [...] } },
+#        { "bib": "091", "direct": false, "changed": true,
+#          "before": { "rank": 1, ... }, "after": { "rank": 2, ... },
+#          "chainDiff": { "added": [], "removed": [] } }   // 仅名次联动
+#      ]
+#    }
+# 预演不会改变 revision、打卡、审计与历史发布版。
+
+# 3) 确认整案：绑定预演时修订号 + token；原子落库，修订只推进一次
+curl -s -X POST http://localhost:3000/api/appeals/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{ "expectedRevision": 3, "token": "<上一步返回的 token>" }'
+# -> { "ok": true, "revision": 4, "auditCount": 3,
+#      "committed": [ ...规范化后的操作集合... ],
+#      "results": [ ...全部选手最新成绩（含名次）... ] }
+
+# 4) 赛事在预演后被他人改动：409 + currentRevision，必须重新预演
+# HTTP/1.1 409 Conflict
+# -> { "error": "赛事已修订，请重新预演后再确认", "currentRevision": 4 }
+
+# 5) 整案无效（重复指定/已作废/缺失打卡/负秒数/缺原因/token 伪造）：400 整案拒绝
+# -> { "error": "打卡 #42 在同一申诉中被重复指定，整案拒绝" }
+```
+
 ---
 
 ## 页面说明
 
 - **成绩排名**：实时成绩、名次（含并列）、状态、失败组/超时说明、每人的最早有效链。
-- **争议复核**：按号码布查看打卡，执行作废/更正并查看完整操作留痕。
+- **整案申诉**：按号码布挑选多条打卡组成同一申诉，逐条作废/更正并填原因；先预演查看所有受影响选手
+  （含名次联动者）处理前后的成绩、名次、失败原因与有效链差异，再一次性原子确认。
+- **争议复核**：按号码布查看打卡，执行单条作废/更正并查看完整操作留痕。
 - **打卡导入**：批量粘贴导入，展示整批校验结果。
 - **关卡设置**：维护起点/终点、终点截止、顺序关卡组、组内替代点位与组截止。
 - **发布冻结**：发布新版本、浏览各历史冻结版的关卡/读数/成绩。
@@ -221,6 +297,8 @@ curl -s http://localhost:3000/api/publications/1
 | GET | `/api/punches?bib=` | 打卡与审计记录 |
 | POST | `/api/punches/:id/void` | 作废（reason 必填） |
 | POST | `/api/punches/:id/correct` | 更正（newPoint/newSeconds/reason） |
+| POST | `/api/appeals/preview` | 整案预演（只读，返回处理前后对比与签名 token；409 过期 / 400 整案无效） |
+| POST | `/api/appeals/confirm` | 整案确认（expectedRevision + token；原子落库只推进一次修订，409 需重新预演） |
 | GET | `/api/results` | 当前实时成绩排名 |
 | POST | `/api/publications` | 发布冻结快照（需 `expectedRevision`） |
 | GET | `/api/publications` / `/api/publications/:version` | 版本列表 / 历史冻结版详情 |
@@ -229,14 +307,15 @@ curl -s http://localhost:3000/api/publications/1
 
 ```
 server/            Express + better-sqlite3 后端
-  src/index.mjs    API 路由
-  src/scoring.mjs  最早有效链与排名算法
+  src/index.mjs    API 路由（含整案申诉 /api/appeals/preview|confirm）
+  src/appeals.mjs  整案操作校验、只读内存预演、签名令牌与原子提交
+  src/scoring.mjs  最早有效链与排名算法（支持内存读数核算）
   src/db.mjs       SQLite 连接/建表/修订号
   src/seed.mjs     演示数据
   src/schema.sql   数据库表结构
-  e2e-test.mjs     端到端断言（56 项，覆盖核算/整批拒绝/修订锁/冻结/更正作废后重导语义）
+  e2e-test.mjs     端到端断言（97 项，覆盖核算/整批拒绝/修订锁/冻结/重导语义/整案申诉两阶段）
 web/               React + Vite 前端
-  src/components/  五个功能页面
+  src/components/  六个功能页面（成绩/整案申诉/单条复核/导入/设置/发布）
 Dockerfile         多阶段构建（前端构建 + 后端 + 运行镜像）
 docker-compose.yml 一键启动、建表、初始化数据，端口 3000
 ```
@@ -248,6 +327,6 @@ docker-compose.yml 一键启动、建表、初始化数据，端口 3000
 rm -f data/orienteering.db*
 SEED=1 node server/src/index.mjs
 
-# 终端 2：运行 56 项断言（含更正/作废后重导语义）
+# 终端 2：运行 97 项断言（含整案申诉预演/确认与更正作废后重导语义）
 node server/e2e-test.mjs http://localhost:3000
 ```

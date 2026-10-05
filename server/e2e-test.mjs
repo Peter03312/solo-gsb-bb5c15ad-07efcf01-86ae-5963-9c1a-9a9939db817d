@@ -226,5 +226,180 @@ console.log('7) 更正/作废后的重导语义（按首次入库原始读数判
   ok('重导后裁判现值仍不被覆盖（A1@250）', still.point === 'A1' && still.seconds === 250);
 }
 
+console.log('8) 整案申诉：预演 + 确认（原子提交、修订绑定、名次联动）');
+{
+  // 8.1 导入三名选手：090 有三条待处理争议读数（重复出发/ZZ 错误点/终点超时）；
+  //     091=700s、092=800s 为完成者（全库此时另有 008=777s 插在两人之间）
+  const r0 = await rev();
+  const setup = await call('/api/punches/import', { method: 'POST', body: JSON.stringify({ expectedRevision: r0, punches: [
+    { recordNo: 'C001', bib: '090', name: '申诉甲', point: 'S', seconds: 0, kind: 'start' },
+    { recordNo: 'C002', bib: '090', point: 'S', seconds: 5, kind: 'start' },
+    { recordNo: 'C005', bib: '090', point: 'A1', seconds: 300, kind: 'enroute' },
+    { recordNo: 'C003', bib: '090', point: 'ZZ', seconds: 9999, kind: 'enroute' },
+    { recordNo: 'C004', bib: '090', point: 'F', seconds: 2000, kind: 'finish' },
+    { recordNo: 'C101', bib: '091', name: '旁观乙', point: 'S', seconds: 0, kind: 'start' },
+    { recordNo: 'C102', bib: '091', point: 'A1', seconds: 200, kind: 'enroute' },
+    { recordNo: 'C103', bib: '091', point: 'B1', seconds: 500, kind: 'enroute' },
+    { recordNo: 'C104', bib: '091', point: 'F', seconds: 700, kind: 'finish' },
+    { recordNo: 'C201', bib: '092', name: '旁观丙', point: 'S', seconds: 0, kind: 'start' },
+    { recordNo: 'C202', bib: '092', point: 'A2', seconds: 200, kind: 'enroute' },
+    { recordNo: 'C203', bib: '092', point: 'B2', seconds: 500, kind: 'enroute' },
+    { recordNo: 'C204', bib: '092', point: 'F', seconds: 800, kind: 'finish' },
+  ]})});
+  ok('8.1 三人数据导入成功（13 条）', setup.status === 200 && setup.body.inserted === 13);
+  const idOf = async (recordNo) =>
+    (await (await fetch(`${BASE}/api/punches?bib=090`, { headers: { 'Content-Type': 'application/json' } })).json())
+      .punches.find(x => x.record_no === recordNo).id;
+  const idC002 = await idOf('C002');
+  const idC003 = await idOf('C003');
+  const idC004 = await idOf('C004');
+
+  const before = await resultsByBib();
+  ok('8.2 预演前 090 出发不唯一（bad_start）', before.get('090').status === 'bad_start');
+  ok('8.2 预演前 091=700 第 1、092=800 第 3（008=777 第 2）',
+    before.get('091').rank === 1 && before.get('092').rank === 3);
+
+  const r1 = await rev();
+  const ops = [
+    { punchId: idC002, action: 'void', reason: '申诉成立：设备重复出发' },
+    { punchId: idC003, action: 'correct', reason: '申诉成立：点位秒数笔误', newPoint: 'B1', newSeconds: 500 },
+    { punchId: idC004, action: 'correct', reason: '申诉成立：终点超时读数有误', newPoint: 'F', newSeconds: 650 },
+  ];
+  const pv = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r1, operations: ops }) });
+  ok('8.3 预演成功并返回 token', pv.status === 200 && typeof pv.body.token === 'string');
+  ok('8.3 预演只读：修订号不变', await rev() === r1);
+  const stillBad = await resultsByBib();
+  ok('8.3 预演不改成绩（090 仍 bad_start）', stillBad.get('090').status === 'bad_start');
+  ok('8.3 预演不写审计', (await call('/api/punches?bib=090')).body.audits.length === 0);
+
+  const am = new Map(pv.body.affected.map(x => [x.bib, x]));
+  ok('8.4 受影响含直接选手 090', am.get('090')?.direct && am.get('090').changed);
+  ok('8.4 090 处理后完成 650',
+    am.get('090').after.status === 'ok' && am.get('090').after.elapsed === 650,
+    JSON.stringify(am.get('090')?.after));
+  ok('8.4 090 处理后链为 S→A1@300→B1(C003)@500→F(C004)@650',
+    JSON.stringify(am.get('090').after.chain.map(c => [c.record_no, c.point, c.seconds])) ===
+    JSON.stringify([['C001', 'S', 0], ['C005', 'A1', 300], ['C003', 'B1', 500], ['C004', 'F', 650]]));
+  ok('8.4 链差异纳入更正后的 C003=B1@500 与 C004=F@650',
+    am.get('090').chainDiff.added.some(c => c.record_no === 'C004' && c.seconds === 650) &&
+    am.get('090').chainDiff.added.some(c => c.record_no === 'C003' && c.point === 'B1'));
+  ok('8.4 091 无直接操作但名次 1→2（名次联动）',
+    !am.get('091').direct && am.get('091').changed &&
+    am.get('091').before.rank === 1 && am.get('091').after.rank === 2);
+  ok('8.4 092 无直接操作但名次 3→4（名次联动）',
+    !am.get('092').direct && am.get('092').changed &&
+    am.get('092').before.rank === 3 && am.get('092').after.rank === 4);
+  ok('8.4 有效链未变的联动者 chainDiff 为空',
+    am.get('091').chainDiff.added.length === 0 && am.get('091').chainDiff.removed.length === 0);
+
+  // 8.5 整案校验失败路径（均不落库）
+  const dup = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r1, operations: [
+    { punchId: idC002, action: 'void', reason: 'a' },
+    { punchId: idC002, action: 'void', reason: 'b' },
+  ]})});
+  ok('8.5 同一打卡重复指定 400', dup.status === 400 && /重复指定/.test(dup.body.error));
+  // C002 此刻仍 active（预演未落库）；用缺失 id、负数秒数、空原因验证整案拒绝
+  const missing = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r1, operations: [
+    { punchId: 999999, action: 'void', reason: 'a' },
+  ]})});
+  ok('8.5 缺失打卡 400 整案拒绝', missing.status === 400);
+  const neg = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r1, operations: [
+    { punchId: idC003, action: 'correct', reason: 'a', newPoint: 'A1', newSeconds: -2 },
+  ]})});
+  ok('8.5 负数秒数 400', neg.status === 400);
+  const noReason = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r1, operations: [
+    { punchId: idC003, action: 'void', reason: '   ' },
+  ]})});
+  ok('8.5 缺原因 400', noReason.status === 400);
+  const stalePv = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r1 - 1, operations: ops })});
+  ok('8.5 预演过期修订 409 带 currentRevision', stalePv.status === 409 && stalePv.body.currentRevision === r1);
+
+  // 8.6 确认：原子落库，修订只推进一次，返回最新成绩
+  const cf = await call('/api/appeals/confirm', { method: 'POST', body: JSON.stringify({ expectedRevision: r1, token: pv.body.token })});
+  ok('8.6 确认成功', cf.status === 200 && cf.body.ok);
+  ok('8.6 修订号只推进一次', cf.body.revision === r1 + 1);
+  ok('8.6 返回逐条审计数量=3', cf.body.auditCount === 3 && cf.body.committed.length === 3);
+  const afterRes = new Map(cf.body.results.map(x => [x.bib, x]));
+  ok('8.6 最新成绩：090=650 第1、091=700 第2、092=800 第4（008=777 第3）',
+    afterRes.get('090').elapsed === 650 && afterRes.get('090').rank === 1 &&
+    afterRes.get('091').rank === 2 && afterRes.get('092').rank === 4);
+
+  const afterPunches = (await call('/api/punches?bib=090')).body;
+  const c002 = afterPunches.punches.find(x => x.record_no === 'C002');
+  const c003 = afterPunches.punches.find(x => x.record_no === 'C003');
+  const c004 = afterPunches.punches.find(x => x.record_no === 'C004');
+  ok('8.6 C002 已 voided 且带原因', c002.status === 'voided' && /设备重复出发/.test(c002.void_reason));
+  ok('8.6 C003 现值 B1@500、原始 ZZ@9999 保留',
+    c003.point === 'B1' && c003.seconds === 500 && c003.orig_point === 'ZZ' && c003.orig_seconds === 9999);
+  ok('8.6 C004 现值 F@650、原始 F@2000 保留', c004.point === 'F' && c004.seconds === 650 && c004.orig_seconds === 2000);
+  const a90 = afterPunches.audits;
+  ok('8.6 三条审计一次性写入（1 void + 2 correct）',
+    a90.length === 3 && a90.filter(a => a.action === 'void').length === 1 &&
+    a90.filter(a => a.action === 'correct').length === 2);
+
+  // 8.7 确认失败路径
+  const reuse = await call('/api/appeals/confirm', { method: 'POST', body: JSON.stringify({ expectedRevision: r1 + 1, token: pv.body.token })});
+  ok('8.7 旧 token 再确认：修订已变 409', reuse.status === 409 && reuse.body.currentRevision === r1 + 1);
+  const tampered = await call('/api/appeals/confirm', { method: 'POST', body: JSON.stringify({ expectedRevision: r1 + 1, token: pv.body.token + 'x' })});
+  ok('8.7 伪造 token 400', tampered.status === 400);
+  const noToken = await call('/api/appeals/confirm', { method: 'POST', body: JSON.stringify({ expectedRevision: r1 + 1 })});
+  ok('8.7 缺 token 400', noToken.status === 400);
+  // 已作废打卡不得再进整案
+  const reVoid = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r1 + 1, operations: [
+    { punchId: idC002, action: 'void', reason: '再次作废' },
+  ]})});
+  ok('8.7 已作废打卡再处理 400', reVoid.status === 400 && /已作废/.test(reVoid.body.error));
+
+  // 8.8 并发场景：预演后赛事被他人改动，旧确认必须 409 且整案不生效
+  const r2 = await rev();
+  const c204 = (await call('/api/punches?bib=092')).body.punches.find(x => x.record_no === 'C204');
+  const pv2 = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r2, operations: [
+    { punchId: c204.id, action: 'correct', reason: '并案：092 终点更正', newPoint: 'F', newSeconds: 750 },
+  ]})});
+  ok('8.8 第二次预演成功', pv2.status === 200);
+  // 他人先用单条接口改了别的打卡，推进修订
+  const c104 = (await call('/api/punches?bib=091')).body.punches.find(x => x.record_no === 'C104');
+  await call(`/api/punches/${c104.id}/correct`, { method: 'POST', body: JSON.stringify({ reason: '他人并行操作', newPoint: 'F', newSeconds: 710 }) });
+  const r3 = await rev();
+  ok('8.8 他人操作后修订推进', r3 === r2 + 1);
+  const staleCf = await call('/api/appeals/confirm', { method: 'POST', body: JSON.stringify({ expectedRevision: r3, token: pv2.body.token })});
+  ok('8.8 旧预演确认被拒 409', staleCf.status === 409 && staleCf.body.currentRevision === r3);
+  const c204After = (await call('/api/punches?bib=092')).body.punches.find(x => x.record_no === 'C204');
+  ok('8.8 被拒整案未部分生效（C204 仍 800）', c204After.seconds === 800);
+  // 重新预演后确认成功
+  const pv3 = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r3, operations: [
+    { punchId: c204.id, action: 'correct', reason: '并案：092 终点更正', newPoint: 'F', newSeconds: 750 },
+  ]})});
+  const cf3 = await call('/api/appeals/confirm', { method: 'POST', body: JSON.stringify({ expectedRevision: r3, token: pv3.body.token })});
+  ok('8.8 重新预演后确认成功，修订再 +1', cf3.status === 200 && cf3.body.revision === r3 + 1);
+  const c204Final = (await call('/api/punches?bib=092')).body.punches.find(x => x.record_no === 'C204');
+  ok('8.8 C204 现值 750', c204Final.seconds === 750);
+
+  // 8.9 无实际名次变化的整案：作废多余打卡，直接选手仍出现在受影响名单
+  const r4 = await rev();
+  // 给 092 加一条无关多余打卡再整案作废
+  const addExtra = await call('/api/punches/import', { method: 'POST', body: JSON.stringify({ expectedRevision: r4, punches: [
+    { recordNo: 'C299', bib: '092', point: 'ZZ', seconds: 900, kind: 'enroute' },
+  ]})});
+  const r5 = await rev();
+  const c299 = (await call('/api/punches?bib=092')).body.punches.find(x => x.record_no === 'C299');
+  const pv4 = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r5, operations: [
+    { punchId: c299.id, action: 'void', reason: '多余读数作废' },
+  ]})});
+  const only = pv4.body.affected;
+  ok('8.9 作废无关多余打卡：受影响仅直接选手 092', only.length === 1 && only[0].bib === '092' && only[0].direct);
+  ok('8.9 直接选手成绩无变化也展示（changed=false）', only[0].changed === false && only[0].after.elapsed === 750);
+  const cf4 = await call('/api/appeals/confirm', { method: 'POST', body: JSON.stringify({ expectedRevision: r5, token: pv4.body.token })});
+  ok('8.9 即使成绩无变化，确认仍成功并推进修订', cf4.status === 200 && cf4.body.revision === r5 + 1);
+}
+
+console.log('9) 整案后历史发布版仍冻结');
+{
+  const snap1 = (await call('/api/publications/1')).body;
+  ok('历史 v1 读数不受整案影响（R0003 仍 A2@300）',
+    snap1.readings.find(x => x.record_no === 'R0003').point === 'A2' &&
+    snap1.readings.find(x => x.record_no === 'R0003').seconds === 300);
+}
+
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 process.exit(fail ? 1 : 0);
