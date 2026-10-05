@@ -226,5 +226,230 @@ console.log('7) 更正/作废后的重导语义（按首次入库原始读数判
   ok('重导后裁判现值仍不被覆盖（A1@250）', still.point === 'A1' && still.seconds === 250);
 }
 
+console.log('8) 整案申诉：预演（不落库）→ 绑定修订号与操作集合确认');
+{
+  // 全新受控场景：导入三名选手后发布冻结一版，再做整案
+  let r = await rev();
+  const imp = await call('/api/punches/import', { method: 'POST', body: JSON.stringify({ expectedRevision: r, punches: [
+    // 090：组2 唯一打卡被误读为 ZZ@99999 => 当前湖畔组未完成（DNF）；
+    // 整案更正为 B1@500 后将以 800s 完赛，把其后所有完赛者名次顶后
+    { recordNo: 'A900', bib: '090', name: '整案选手', point: 'S', seconds: 0, kind: 'start' },
+    { recordNo: 'A901', bib: '090', point: 'ZZ', seconds: 99999, kind: 'enroute' },
+    { recordNo: 'A902', bib: '090', point: 'A1', seconds: 300, kind: 'enroute' },
+    { recordNo: 'A904', bib: '090', point: 'F', seconds: 800, kind: 'finish' },
+    // 091：完成 900；090 更正完赛后 091 名次仅因他人变化而后退
+    { recordNo: 'A910', bib: '091', name: '连带选手', point: 'S', seconds: 0, kind: 'start' },
+    { recordNo: 'A911', bib: '091', point: 'A2', seconds: 200, kind: 'enroute' },
+    { recordNo: 'A912', bib: '091', point: 'B2', seconds: 600, kind: 'enroute' },
+    { recordNo: 'A913', bib: '091', point: 'F', seconds: 900, kind: 'finish' },
+    // 092：完成 1300，另含一条多余晚终点 A925（整案作废它，不影响其有效链与成绩）
+    { recordNo: 'A920', bib: '092', name: '作废选手', point: 'S', seconds: 0, kind: 'start' },
+    { recordNo: 'A921', bib: '092', point: 'A1', seconds: 320, kind: 'enroute' },
+    { recordNo: 'A922', bib: '092', point: 'B2', seconds: 760, kind: 'enroute' },
+    { recordNo: 'A923', bib: '092', point: 'F', seconds: 1300, kind: 'finish' },
+    { recordNo: 'A925', bib: '092', point: 'XX', seconds: 1700, kind: 'enroute' }, // 无关点位，作废不影响成绩
+  ]})});
+  ok('导入 090/091/092 共 13 条', imp.status === 200 && imp.body.inserted === 13, JSON.stringify(imp.body));
+  r = imp.body.revision;
+
+  const pub = await call('/api/publications', { method: 'POST', body: JSON.stringify({ expectedRevision: r, note: '整案前冻结' }) });
+  ok('整案前发布一版', pub.status === 200);
+  const frozenVersion = pub.body.version;
+  r = pub.body.revision;
+  const revBeforeCase = r;
+
+  const ids = new Map();
+  for (const b of ['090', '091', '092']) {
+    const d = (await call(`/api/punches?bib=${b}`)).body.punches;
+    d.forEach(p => ids.set(p.record_no, p.id));
+  }
+  const idBad = ids.get('A901');   // 090 误读
+  const idLate = ids.get('A925');  // 092 多余晚终点
+
+  const before = await resultsByBib();
+  ok('预演前：090 湖畔组未完成（DNF），091 以 900、092 以 1300 完赛',
+    before.get('090').status === 'group_dnf' && before.get('090').failAt === '湖畔组' &&
+    before.get('091').elapsed === 900 && before.get('092').elapsed === 1300);
+  const rank091Before = before.get('091').rank;
+  const rank092Before = before.get('092').rank;
+
+  // 8.1 整案操作集合校验（任一非法 => 整案拒绝）
+  const dup = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r, operations: [
+    { punchId: idBad, action: 'void', reason: 'x' },
+    { punchId: idBad, action: 'correct', reason: 'y', newPoint: 'A2', newSeconds: 250 },
+  ]})});
+  ok('同一打卡重复指定：400 整案拒绝', dup.status === 400 && /重复指定/.test(dup.body.error));
+  const missing = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r, operations: [
+    { punchId: 999999, action: 'void', reason: 'x' },
+  ]})});
+  ok('缺失打卡：400 整案拒绝', missing.status === 400 && /不存在/.test(missing.body.error));
+  const neg = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r, operations: [
+    { punchId: idBad, action: 'correct', reason: 'x', newPoint: 'A2', newSeconds: -1 },
+  ]})});
+  ok('更正负秒数：400', neg.status === 400 && /非负整数/.test(neg.body.error));
+  const noPoint = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r, operations: [
+    { punchId: idBad, action: 'correct', reason: 'x', newPoint: '   ', newSeconds: 10 },
+  ]})});
+  ok('更正缺点位：400', noPoint.status === 400 && /点位必填/.test(noPoint.body.error));
+  const noReason = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r, operations: [
+    { punchId: idBad, action: 'void', reason: '   ' },
+  ]})});
+  ok('缺少原因：400', noReason.status === 400);
+  const badAction = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r, operations: [
+    { punchId: idBad, action: 'delete', reason: 'x' },
+  ]})});
+  ok('非法 action：400', badAction.status === 400 && /void 或 correct/.test(badAction.body.error));
+  const stale = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r + 999, operations: [
+    { punchId: idBad, action: 'void', reason: 'x' },
+  ]})});
+  ok('预演过期修订：409 并返回 currentRevision', stale.status === 409 && stale.body.currentRevision === r);
+  const noRev = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ operations: [] })});
+  ok('预演缺修订号/空操作集：400', noRev.status === 400);
+
+  // 8.2 合法预演（更正 A901 为 B1@500 补全 090 的组2 => 090 以 800 完赛；作废 A925 不影响 092 链）
+  const caseOps = [
+    { punchId: idBad, action: 'correct', reason: '依据申诉照片更正误读', newPoint: 'B1', newSeconds: 500 },
+    { punchId: idLate, action: 'void', reason: '申诉：多余晚终点作废' },
+  ];
+  const pv = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r, operations: caseOps })});
+  ok('预演成功并返回指纹', pv.status === 200 && typeof pv.body.caseFingerprint === 'string' && pv.body.revision === r);
+  ok('预演含两条逐条投影（before/after）',
+    pv.body.projections.length === 2 &&
+    pv.body.projections[0].before.point === 'ZZ' && pv.body.projections[0].after.point === 'B1' &&
+    pv.body.projections[1].before.status === 'active' && pv.body.projections[1].after.status === 'voided');
+  const af090 = pv.body.affected.find(a => a.bib === '090');
+  ok('预演 090：group_dnf -> ok、耗时 800，有效链补齐 S/A1/B1/F',
+    af090.directlyAffected && af090.statusChanged && af090.elapsedChanged && af090.chainChanged &&
+    af090.before.status === 'group_dnf' && af090.before.failAt === '湖畔组' &&
+    af090.after.status === 'ok' && af090.after.elapsed === 800 &&
+    JSON.stringify(af090.after.chain.map(c => c.point)) === JSON.stringify(['S','A1','B1','F']) &&
+    af090.chainDiff.added.some(c => c.record_no === 'A901' && c.point === 'B1' && c.seconds === 500),
+    JSON.stringify(af090?.after));
+  const af091 = pv.body.affected.find(a => a.bib === '091');
+  ok('091 无打卡被处理，却因 090 完赛进入受影响名单（仅连带，名次后退 1 位）',
+    af091 && af091.directlyAffected === false && af091.rankChanged &&
+    af091.before.rank === rank091Before && af091.after.rank === rank091Before + 1 &&
+    af091.elapsedChanged === false && af091.chainChanged === false &&
+    af091.failureChanged === false);
+  const af092 = pv.body.affected.find(a => a.bib === '092');
+  ok('092 直接被作废：耗时与有效链不变（名次被 090 顶后 1 位）',
+    af092.directlyAffected && af092.before.elapsed === 1300 && af092.after.elapsed === 1300 &&
+    af092.after.rank === rank092Before + 1 && af092.chainChanged === false);
+  // 090 以 800s 完赛插到榜首：此前所有完赛者（含种子选手 001）都仅因他人变化而后退 1 位
+  const af001 = pv.body.affected.find(a => a.bib === '001');
+  ok('001 无任何操作也在受影响名单：仅连带名次后退，成绩/失败原因/链均不变',
+    af001 && af001.directlyAffected === false && af001.rankChanged &&
+    af001.before.rank + 1 === af001.after.rank &&
+    af001.elapsedChanged === false && af001.chainChanged === false &&
+    af001.failureChanged === false);
+  const cascadeBibs = ['001','004','006','091','092'];
+  ok('所有被顶后的完赛者都在受影响名单中',
+    cascadeBibs.every(b => pv.body.affected.some(a => a.bib === b && a.after.rank === a.before.rank + 1)));
+  ok('未受影响的 DNF 选手（002/003）不在受影响名单',
+    !pv.body.affected.some(a => a.bib === '002' || a.bib === '003'));
+  const pre090 = await call('/api/punches?bib=090');
+  const pre092 = await call('/api/punches?bib=092');
+  ok('预演只读：修订号不变、A901 仍 ZZ、A925 仍 active、两名选手尚无审计',
+    (await rev()) === r &&
+    pre090.body.punches.find(p => p.record_no === 'A901').point === 'ZZ' &&
+    pre092.body.punches.find(p => p.record_no === 'A925').status === 'active' &&
+    pre090.body.audits.length === 0 && pre092.body.audits.length === 0);
+
+  // 8.3 确认绑定：缺字段 / 指纹不符 / 赛事已变化
+  const noFp = await call('/api/appeals/confirm', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r, operations: caseOps })});
+  ok('确认缺 caseFingerprint：400', noFp.status === 400);
+  const badFp = await call('/api/appeals/confirm', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r, caseFingerprint: 'nope', operations: caseOps })});
+  ok('指纹不匹配（操作集合与预演不同）：409 要求重新预演', badFp.status === 409 && /重新预演/.test(badFp.body.error));
+  // 他人先改动数据推进修订号（单条作废一张与本案无关的卡）
+  const other = await call(`/api/punches/${ids.get('A911')}/void`, { method: 'POST', body: JSON.stringify({ reason: '他人变更' }) });
+  ok('他人单条作废推进修订', other.status === 200);
+  r = other.body.revision;
+  const staleConfirm = await call('/api/appeals/confirm', { method: 'POST', body: JSON.stringify({
+    expectedRevision: revBeforeCase, caseFingerprint: pv.body.caseFingerprint, operations: caseOps })});
+  ok('确认时赛事已变化：409 且返回 currentRevision，要求重新预演',
+    staleConfirm.status === 409 && staleConfirm.body.currentRevision === r);
+  ok('过期确认未部分生效（A901 仍 ZZ、A925 仍 active、修订只 +1）',
+    (await call('/api/punches?bib=090')).body.punches.find(p => p.record_no === 'A901').point === 'ZZ' &&
+    (await call('/api/punches?bib=092')).body.punches.find(p => p.record_no === 'A925').status === 'active' &&
+    (await rev()) === r);
+
+  // 8.4 重新预演并成功确认：单事务、修订号只 +1、逐条审计
+  const pv2 = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r, operations: caseOps })});
+  ok('赛事变化后须用新修订号重新预演', pv2.status === 200 && pv2.body.revision === r);
+  const conf = await call('/api/appeals/confirm', { method: 'POST', body: JSON.stringify({
+    expectedRevision: r, caseFingerprint: pv2.body.caseFingerprint, operations: caseOps })});
+  ok('确认成功', conf.status === 200, JSON.stringify(conf.body));
+  ok('修订号只推进一次', conf.body.revision === r + 1);
+  r = conf.body.revision;
+  // 注意：确认发生在 8.3 他人作废 091 的 A911 之后，此时 091 已为组未完成；
+  // 以重预演 pv2 的 after 名次为准核对连带变化（092 在新基线上同样被 090 顶后 1 位）。
+  const pv2_092 = pv2.body.affected.find(a => a.bib === '092');
+  ok('返回最新成绩：090=ok/800、092=ok/1300；091 因 A911 已作废为 group_dnf',
+    (() => {
+      const m = new Map(conf.body.results.map(x => [x.bib, x]));
+      return m.get('090').status === 'ok' && m.get('090').elapsed === 800 &&
+        m.get('090').chain.some(c => c.record_no === 'A901' && c.point === 'B1' && c.seconds === 500) &&
+        m.get('092').status === 'ok' && m.get('092').elapsed === 1300 &&
+        m.get('092').rank === pv2_092.after.rank &&
+        m.get('091').status === 'group_dnf' && m.get('091').rank == null;
+    })());
+  const p090 = (await call('/api/punches?bib=090')).body;
+  const p092 = (await call('/api/punches?bib=092')).body;
+  ok('逐条审计一次性落库：090 一条更正（原值 ZZ@99999），092 一条作废',
+    p090.audits.length === 1 && p090.audits[0].action === 'correct' &&
+    p090.audits[0].origPoint === 'ZZ' && p090.audits[0].origSeconds === 99999 &&
+    p090.audits[0].newPoint === 'B1' && p090.audits[0].newSeconds === 500 &&
+    p090.audits[0].reason === '依据申诉照片更正误读' &&
+    p092.audits.length === 1 && p092.audits[0].action === 'void' &&
+    p092.audits[0].reason === '申诉：多余晚终点作废');
+  ok('现值/状态正确：A901=B1@500 active；A925=voided 且带作废原因',
+    p090.punches.find(p => p.record_no === 'A901').point === 'B1' &&
+    p090.punches.find(p => p.record_no === 'A901').seconds === 500 &&
+    p090.punches.find(p => p.record_no === 'A901').status === 'active' &&
+    p092.punches.find(p => p.record_no === 'A925').status === 'voided' &&
+    /多余晚终点/.test(p092.punches.find(p => p.record_no === 'A925').void_reason));
+
+  // 8.5 已作废/重复/无变化的整案拒绝（确认后状态下）
+  const voidedCorrect = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r, operations: [
+    { punchId: idLate, action: 'correct', reason: 'x', newPoint: 'F', newSeconds: 1700 },
+  ]})});
+  ok('已作废打卡更正：400 整案拒绝', voidedCorrect.status === 400 && /已作废/.test(voidedCorrect.body.error));
+  const voidAgain = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r, operations: [
+    { punchId: idLate, action: 'void', reason: 'x' },
+  ]})});
+  ok('已作废打卡重复作废：400', voidAgain.status === 400);
+  const sameVal = await call('/api/appeals/preview', { method: 'POST', body: JSON.stringify({ expectedRevision: r, operations: [
+    { punchId: idBad, action: 'correct', reason: 'x', newPoint: 'B1', newSeconds: 500 },
+  ]})});
+  ok('更正新值与现值相同：400', sameVal.status === 400 && /无需更正/.test(sameVal.body.error));
+  const noRevConfirm = await call('/api/appeals/confirm', { method: 'POST', body: JSON.stringify({ operations: [] })});
+  ok('确认缺修订号：400', noRevConfirm.status === 400);
+
+  // 8.6 首次入库原始读数仍用于重导判定；整案更正不改变 orig_*
+  const reOrig = await call('/api/punches/import', { method: 'POST', body: JSON.stringify({ expectedRevision: r, punches: [
+    { recordNo: 'A901', bib: '090', point: 'ZZ', seconds: 99999, kind: 'enroute' },
+  ]})});
+  ok('整案更正后按原始读数 ZZ@99999 重导：幂等跳过，不覆盖现值',
+    reOrig.status === 200 && reOrig.body.inserted === 0 && reOrig.body.skipped === 1 &&
+    reOrig.body.revision === r &&
+    (await call('/api/punches?bib=090')).body.punches.find(p => p.record_no === 'A901').point === 'B1');
+  const reCurrent = await call('/api/punches/import', { method: 'POST', body: JSON.stringify({ expectedRevision: r, punches: [
+    { recordNo: 'A901', bib: '090', point: 'B1', seconds: 500, kind: 'enroute' },
+  ]})});
+  ok('用现值 B1@500（异于原始读数）重导：仍 400 整批拒绝', reCurrent.status === 400 && /A901/.test(reCurrent.body.error));
+
+  // 8.7 历史发布版保持冻结
+  const snap = (await call(`/api/publications/${frozenVersion}`)).body;
+  ok('整案前发布版仍冻结：A901 为 ZZ@99999、A925 在有效读数中',
+    snap.readings.some(x => x.record_no === 'A901' && x.point === 'ZZ' && x.seconds === 99999) &&
+    snap.readings.some(x => x.record_no === 'A925'));
+  const snap090 = snap.results.find(x => x.bib === '090');
+  const snap091 = snap.results.find(x => x.bib === '091');
+  ok('冻结版成绩不随后续整案改变（090 仍 group_dnf，091 名次为整案前值）',
+    snap090.status === 'group_dnf' && snap090.elapsed == null && snap091.rank === rank091Before);
+}
+
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 process.exit(fail ? 1 : 0);

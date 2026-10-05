@@ -25,8 +25,34 @@ export function loadConfig(db) {
 export function computeResults(db, config = loadConfig(db)) {
   if (!config) return [];
   const runners = db.prepare('SELECT bib, name FROM runner ORDER BY bib').all();
-  const results = runners.map((r) => computeRunner(db, config, r.bib, r.name));
-  // 完成者按耗时升序；其余不排名
+  const punches = db
+    .prepare('SELECT id, record_no, bib, point, seconds, kind, status FROM punch')
+    .all();
+  return computeResultsOnReadings(config, runners, punches);
+}
+
+/**
+ * 纯内存核算：给定配置、选手与打卡快照（整案预演用，绝不触碰数据库）。
+ * punches 字段需含 id/record_no/bib/point/seconds/kind/status。
+ */
+export function computeResultsOnReadings(config, runners, punches) {
+  const byBib = new Map();
+  for (const p of punches) {
+    if (p.status !== 'active') continue;
+    if (!byBib.has(p.bib)) byBib.set(p.bib, []);
+    byBib.get(p.bib).push(p);
+  }
+  for (const list of byBib.values()) {
+    list.sort((a, b) => (a.seconds !== b.seconds ? a.seconds - b.seconds : a.id - b.id));
+  }
+  const results = runners.map((r) =>
+    computeRunnerFromReadings(config, r.bib, r.name ?? null, byBib.get(r.bib) ?? [])
+  );
+  return rankResults(results);
+}
+
+/** 排序并赋予并列名次（完成者按耗时升序；其余不排名） */
+export function rankResults(results) {
   results.sort((a, b) => {
     if (a.elapsed == null && b.elapsed == null) return a.bib.localeCompare(b.bib);
     if (a.elapsed == null) return 1;
@@ -34,7 +60,6 @@ export function computeResults(db, config = loadConfig(db)) {
     if (a.elapsed !== b.elapsed) return a.elapsed - b.elapsed;
     return a.bib.localeCompare(b.bib);
   });
-  // 并列名次
   let rank = 0;
   let prevElapsed = null;
   results.forEach((r, i) => {
@@ -48,17 +73,22 @@ export function computeResults(db, config = loadConfig(db)) {
 }
 
 /**
- * 单个选手的有效链。
+ * 单个选手的有效链（数据库版，保留旧接口）。
  * 有效读数 = status='active'（作废/已被更正的旧读数不参与）。
  */
 export function computeRunner(db, config, bib, name = null) {
-  const base = { bib, name, status: 'ok', elapsed: null, failAt: null, detail: '', chain: [] };
   const punches = db
     .prepare(
       `SELECT id, record_no, point, seconds, kind FROM punch
        WHERE bib = ? AND status = 'active' ORDER BY seconds, id`
     )
     .all(bib);
+  return computeRunnerFromReadings(config, bib, name, punches);
+}
+
+/** 单个选手的有效链：纯读数版，逻辑与数据库版严格一致 */
+export function computeRunnerFromReadings(config, bib, name = null, punches) {
+  const base = { bib, name, status: 'ok', elapsed: null, failAt: null, detail: '', rank: null, chain: [] };
 
   // 唯一出发打卡（kind=start）。途中再次经过起点的打卡属于多余打卡，不作出发依据。
   const starts = punches.filter((p) => p.kind === 'start');

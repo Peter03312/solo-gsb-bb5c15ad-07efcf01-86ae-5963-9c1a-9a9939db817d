@@ -4,11 +4,13 @@ import Setup from './components/Setup.jsx';
 import Import from './components/Import.jsx';
 import Results from './components/Results.jsx';
 import Review from './components/Review.jsx';
+import AppealCase from './components/AppealCase.jsx';
 import Publish from './components/Publish.jsx';
 
 const TABS = [
   { key: 'results', label: '成绩排名' },
   { key: 'review', label: '争议复核' },
+  { key: 'appeal', label: '整案申诉' },
   { key: 'import', label: '打卡导入' },
   { key: 'setup', label: '关卡设置' },
   { key: 'publish', label: '发布冻结' },
@@ -80,6 +82,7 @@ export default function App() {
         {tab === 'import' && <Import event={event} onChanged={refreshEvent} onError={showStale} />}
         {tab === 'results' && <Results />}
         {tab === 'review' && <Review event={event} onChanged={refreshEvent} onError={showStale} />}
+        {tab === 'appeal' && <AppealCase event={event} onChanged={refreshEvent} onError={showStale} />}
         {tab === 'publish' && <Publish event={event} onChanged={refreshEvent} onError={showStale} />}
       </main>
     </div>

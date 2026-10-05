@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { getDb, initDb, bumpRevision, currentRevision } from './db.mjs';
 import { loadConfig, computeResults } from './scoring.mjs';
 import { seedDemo } from './seed.mjs';
+import { parseOperations, fingerprint, simulate, commitAppeal } from './appeals.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -274,6 +275,75 @@ app.post('/api/punches/:id/correct', (req, res) => {
     return bumpRevision(db);
   })();
   res.json({ ok: true, revision });
+});
+
+// ---------- 裁判：整案申诉（预演 / 确认） ----------
+/**
+ * 整案预演：同一申诉的多条打卡作废/更正一次性基于当前修订号在内存中核算。
+ * 预演不改动打卡、审计、修订号或历史发布版，只返回处理前后所有受影响选手的
+ * 成绩、名次、失败原因与有效链差异（含仅因他人变化而名次改变的选手）。
+ * 请求体：{ expectedRevision, operations: [{ punchId, action, reason, newPoint?, newSeconds? }] }
+ */
+app.post('/api/appeals/preview', (req, res) => {
+  if (!checkRevision(req, res)) return;
+  const cfg = loadConfig(db);
+  if (!cfg) return badRequest(res, '赛事尚未配置，请先设置关卡组');
+  const parsed = parseOperations(req.body);
+  if (parsed.error) return badRequest(res, parsed.error);
+  const sim = simulate(db, cfg, currentRevision(db), parsed.operations);
+  if (!sim.ok) {
+    return res
+      .status(sim.status)
+      .json({ error: sim.error, ...(sim.currentRevision != null ? { currentRevision: sim.currentRevision } : {}) });
+  }
+  res.json({
+    preview: true,
+    revision: currentRevision(db),
+    caseFingerprint: fingerprint(currentRevision(db), parsed.operations),
+    operations: sim.operations,
+    projections: sim.projections,
+    affected: sim.affected,
+    resultsAfter: sim.after,
+  });
+});
+
+/**
+ * 整案确认：必须绑定预演返回的修订号（expectedRevision）与操作集合（caseFingerprint）。
+ * 赛事已变化（修订号不一致或指纹不匹配）返回 409 及 currentRevision，要求重新预演；
+ * 缺失打卡或任一操作无效 => 整案拒绝（单事务回滚，绝不部分生效）。
+ * 成功后全部变更与逐条审计一次性落库，修订号只推进一次，返回最新成绩。
+ */
+app.post('/api/appeals/confirm', (req, res) => {
+  const expectedRaw = req.body?.expectedRevision;
+  const expected = Number(expectedRaw);
+  if (expectedRaw == null || !Number.isInteger(expected) || expected < 0)
+    return badRequest(res, '缺少 expectedRevision');
+  const cfg = loadConfig(db);
+  if (!cfg) return badRequest(res, '赛事尚未配置，请先设置关卡组');
+  if (typeof req.body?.caseFingerprint !== 'string' || !req.body.caseFingerprint.trim())
+    return badRequest(res, '缺少 caseFingerprint（请先调用整案预演并回传其指纹）');
+  const parsed = parseOperations(req.body);
+  if (parsed.error) return badRequest(res, parsed.error);
+
+  try {
+    const out = commitAppeal(db, cfg, {
+      expectedRevision: expected,
+      operations: parsed.operations,
+      caseFingerprint: req.body.caseFingerprint.trim(),
+    });
+    res.json({
+      ok: true,
+      revision: out.revision,
+      applied: out.applied,
+      affected: out.affected,
+      results: out.results,
+    });
+  } catch (err) {
+    const status = err.status || 500;
+    res
+      .status(status)
+      .json({ error: err.message, ...(err.currentRevision != null ? { currentRevision: err.currentRevision } : {}) });
+  }
 });
 
 // ---------- 发布（冻结） ----------

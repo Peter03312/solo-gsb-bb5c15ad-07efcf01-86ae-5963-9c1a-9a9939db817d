@@ -103,3 +103,20 @@ input[type="text"], input:not([type]), input[type="number"], textarea {
 @media (max-width: 900px) {
   .snap-columns, .form-row.three { grid-template-columns: 1fr; }
 }
+
+/* ---- 整案申诉 ---- */
+.case-cart { border: 1px solid #c5d3e3; border-radius: 8px; padding: 12px 14px; margin: 14px 0; background: #f7faff; }
+.case-cart h3 { margin: 0 0 8px; font-size: 15px; }
+.case-actions { display: flex; gap: 10px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+.preview-box { border: 1px solid #0b5fff44; border-radius: 8px; padding: 12px 14px; margin: 16px 0; background: #f4f7ff; }
+.preview-box h3 { margin: 0 0 6px; }
+.preview-box h4, .case-result h4 { margin: 10px 0 6px; font-size: 14px; }
+.notice.ok { background: #e6f9ea; border: 1px solid #9fe0af; }
+.case-result { padding: 12px 14px; }
+.case-result .notice, .case-result > div:first-child { position: relative; }
+.tag-cell { white-space: normal; }
+.tag-cell .badge { margin: 1px 3px 1px 0; }
+.chain-diff { min-width: 200px; }
+.diff-add { color: #1b6b32; }
+.diff-remove { color: #a80707; text-decoration: line-through; }
+.diff-mod { color: #8a6100; }
